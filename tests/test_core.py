@@ -161,7 +161,8 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("#", str(plan.sources[0].path))
             rtn.write_nuke_script(plan, settings, {})
             body = plan.script_path.read_text()
-            self.assertIn('mov64_codec "H.264"', body)
+            self.assertIn('mov64_codec "h264"', body)
+        self.assertIn(' fps 24', body)
             self.assertIn(" first 1", body)
             self.assertIn(" last 10", body)
 

@@ -100,9 +100,13 @@ exported source duration.
   range. In both cases TimeClip holds the Resolve source in/out trim and places
   it at the Nuke shot range; image-sequence plates retain their rendered frame
   numbering.
-- For MOV Write targets, choose a Nuke codec (Apple ProRes, H.264, DNxHR, or
-  Uncompressed). The generated Write node stores this as Nuke's MOV codec
-  setting.
+- For MOV Write targets, choose a Nuke codec (Apple ProRes, Avid DNxHR, Avid
+  DNxHD, H.264, Animation, PNG, Photo - JPEG, Motion JPEG A/B, MPEG-4, or
+  Uncompressed) and, where Nuke exposes one, a codec profile. The Write node
+  stores Nuke's codec FourCC (e.g. `appr`, `AVdh`) plus the profile knob, and
+  follows the script frame rate via `mov64_fps {{root.fps}}`.
+- The generated script's Root `fps` is taken from the Resolve timeline frame
+  rate.
 - `AddTimeCode` is created directly before Write from the selected source
   track's source timecode. It falls back to the shot track and is omitted if
   no source timecode exists.

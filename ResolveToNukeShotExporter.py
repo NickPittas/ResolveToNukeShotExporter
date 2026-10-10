@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
-SCRIPT_VERSION = "0.4.7"
+SCRIPT_VERSION = "0.4.8"
 TOKENS = {
     "project", "timeline", "sequence", "shot", "shot_index", "track",
     "track_index", "clip", "clip_index", "version", "ext", "frame", "date",
@@ -56,7 +56,30 @@ NUKE_WRITE_TYPES = {
     "QuickTime MOV": ("mov", "mov"),
     "MXF": ("mxf", "mxf"),
 }
-NUKE_MOV_CODECS = ("Apple ProRes", "H.264", "DNxHR", "Uncompressed")
+NUKE_MOV_CODECS = {
+    "Apple ProRes": "appr", "Avid DNxHR": "AVdh", "Avid DNxHD": "AVdn", "H.264": "h264",
+    "Animation": "rle ", "PNG": "png ", "Photo - JPEG": "jpeg", "Motion JPEG A": "mjpa",
+    "Motion JPEG B": "mjpb", "MPEG-4": "mp4v", "Uncompressed": "v210",
+}
+NUKE_MOV_CODEC_ALIASES = {"DNxHR": "Avid DNxHR", "DNxHD": "Avid DNxHD"}  # legacy preset values
+# codec display name -> (profile knob name, ordered profile values, default)
+NUKE_MOV_PROFILES = {
+    "Apple ProRes": ("mov_prores_codec_profile", (
+        "ProRes 4:4:4:4 XQ 12-bit", "ProRes 4:4:4:4 12-bit", "ProRes 4:2:2 HQ 10-bit",
+        "ProRes 4:2:2 10-bit", "ProRes 4:2:2 LT 10-bit", "ProRes 4:2:2 Proxy 10-bit"), "ProRes 4:2:2 HQ 10-bit"),
+    "Avid DNxHR": ("mov64_dnxhr_codec_profile", (
+        "4:4:4 12-bit", "HQX 4:2:2 12-bit", "HQ 4:2:2 8-bit", "SQ 4:2:2 8-bit", "LB 4:2:2 8-bit"), "HQX 4:2:2 12-bit"),
+    "Avid DNxHD": ("mov64_dnxhd_codec_profile", (
+        "DNxHD 444 10-bit 440Mbit", "DNxHD 422 10-bit 220Mbit", "DNxHD 422 8-bit 220Mbit",
+        "DNxHD 422 8-bit 145Mbit", "DNxHD 422 8-bit 36Mbit"), "DNxHD 422 10-bit 220Mbit"),
+    "H.264": ("mov_h264_codec_profile", (
+        "High 4:2:0 8-bit", "Main 4:2:0 8-bit", "Baseline 4:2:0 8-bit"), "High 4:2:0 8-bit"),
+}
+
+
+def normalise_mov_codec(name: str) -> str:
+    name = NUKE_MOV_CODEC_ALIASES.get(name, name)
+    return name if name in NUKE_MOV_CODECS else "Apple ProRes"
 IMAGE_SEQUENCE_EXTENSIONS = frozenset({
     "ari", "bmp", "cin", "dpx", "exr", "iff", "jpeg", "jpg", "png", "sgi", "tif", "tiff", "tga",
 })
@@ -120,6 +143,7 @@ class ExportSettings:
     plate_extension: str = "exr"
     write_file_type: str = "exr"
     nuke_write_codec: str = "Apple ProRes"
+    nuke_write_profile: str = ""
     nuke_start_frame: int = 1001
     plate_format: str = "exr"
     plate_codec: str = ""
@@ -452,7 +476,24 @@ def _write_text_exclusive(path: Path, content: str) -> None:
         raise ExportError("Refusing to overwrite existing file: %s" % path) from exc
 
 
-def write_nuke_script(plan: PlannedShot, settings: ExportSettings, colour_context: Mapping[str, Any]) -> None:
+def _format_fps(fps: float) -> str:
+    return ("%.3f" % fps).rstrip("0").rstrip(".")
+
+
+def _mov_write_lines(settings: ExportSettings) -> List[str]:
+    codec = normalise_mov_codec(settings.nuke_write_codec)
+    lines = [" mov64_codec \"%s\"" % NUKE_MOV_CODECS[codec]]
+    if codec in NUKE_MOV_PROFILES:
+        knob, values, default = NUKE_MOV_PROFILES[codec]
+        profile = settings.nuke_write_profile if settings.nuke_write_profile in values else default
+        lines.append(" %s \"%s\"" % (knob, profile))
+        if codec == "H.264":
+            lines.append(" mov64_h264_codec_profile \"%s\"" % profile)
+    lines.append(" mov64_fps {{root.fps}}")
+    return lines
+
+
+def write_nuke_script(plan: PlannedShot, settings: ExportSettings, colour_context: Mapping[str, Any], fps: float = 24.0) -> None:
     """Write a simple, editable Nuke graph. Caller must preflight first."""
     primary = _primary_source(plan)
     primary_first, primary_last = _nuke_timeclip_range(primary)
@@ -464,6 +505,7 @@ def write_nuke_script(plan: PlannedShot, settings: ExportSettings, colour_contex
         "Root {",
         " first_frame %d" % script_first,
         " last_frame %d" % script_last,
+        " fps %s" % _format_fps(fps),
         "}",
         "",
     ]
@@ -538,7 +580,7 @@ def write_nuke_script(plan: PlannedShot, settings: ExportSettings, colour_contex
         " inputs 1",
         " file \"%s\"" % _nuke_quote(plan.write_path.as_posix()),
         " file_type %s" % _nuke_quote(settings.write_file_type),
-        *( [" mov64_codec \"%s\"" % _nuke_quote(settings.nuke_write_codec)] if settings.write_file_type == "mov" and settings.nuke_write_codec else [] ),
+        *(_mov_write_lines(settings) if settings.write_file_type == "mov" else []),
         " channels rgb",
         " create_directories true",
         " name %s" % _nuke_name("Write_%s" % plan.shot.name, "Write"),
@@ -776,14 +818,14 @@ class ResolveExporter:
         timeline_settings = _call(self.timeline, "GetSetting", {})
         wanted = ("colorScienceMode", "timelineFrameRate", "timelineResolutionWidth", "timelineResolutionHeight",
                   "colorSpaceTimeline", "colorSpaceOutput", "colorSpaceInput")
-        return {key: settings.get(key, timeline_settings.get(key, "")) for key in wanted if settings.get(key, timeline_settings.get(key, "")) != ""}
+        return {key: timeline_settings.get(key, settings.get(key, "")) for key in wanted if timeline_settings.get(key, settings.get(key, "")) != ""}
 
     def fps(self) -> float:
         value = _call(self.timeline, "GetSetting", "", "timelineFrameRate") or _call(self.project, "GetSetting", "", "timelineFrameRate")
-        try:
-            return float(str(value).replace(" DF", ""))
-        except ValueError:
+        match = re.search(r"\d+(?:\.\d+)?", str(value))
+        if not match or float(match.group(0)) <= 0:
             return 24.0
+        return float(match.group(0))
 
     def render_options(self) -> Dict[str, Dict[str, Any]]:
         formats = _call(self.project, "GetRenderFormats", {})
@@ -874,7 +916,8 @@ class ResolveExporter:
 
     def export(self, settings: ExportSettings) -> List[PlannedShot]:
         shots = inspect_timeline(self.timeline, settings.selected_tracks, settings.shot_track)
-        plans = build_plan(shots, settings, self.fps())
+        fps = self.fps()
+        plans = build_plan(shots, settings, fps)
         collisions = preflight(plans)
         if collisions:
             raise ExportError("Export blocked; no files were written:\n- " + "\n- ".join(collisions))
@@ -882,7 +925,7 @@ class ResolveExporter:
             for source in plan.sources:
                 if source.use_plate:
                     self.render_isolated_plate(source, settings)
-            write_nuke_script(plan, settings, self.colour_context())
+            write_nuke_script(plan, settings, self.colour_context(), fps)
             write_manifest(plan, settings, self.colour_context())
         return plans
 
@@ -1002,6 +1045,7 @@ def _ui_settings(items: Mapping[str, Any], render_options: Optional[Mapping[str,
         plate_template=text("plate_template", DEFAULT_PLATE_TEMPLATE),
         write_extension=write_extension, plate_extension=text("plate_ext", "exr"),
         write_file_type=write_file_type, nuke_write_codec=text("nuke_write_codec", "Apple ProRes"),
+        nuke_write_profile=text("nuke_write_profile", ""),
         nuke_start_frame=int(text("nuke_start_frame", "1001")), plate_format=plate_format,
         plate_codec=plate_codec, selected_tracks=tracks, shot_track=int(shot_track_values[-1]) if shot_track_values else 0,
         export_plates=checked("export_plates"), plate_tracks=plate_tracks,
@@ -1032,21 +1076,21 @@ def show_ui(resolve: Any, project: Any, timeline: Any, fusion: Any, ui: Any, dis
 Paths are relative to Project Root. Use {track} in rename templates when names must be unique across tracks."""
 
     def section(text: str) -> Any:
-        return ui.Label({"Text": text, "Weight": 0, "StyleSheet": "font-weight: bold; font-size: 14px"})
+        return ui.Label({"Text": text, "Weight": 0, "MinimumSize": [0, 24], "MaximumSize": [16777215, 24], "StyleSheet": "font-weight: bold; font-size: 14px"})
 
     def row(label: str, controls: Sequence[Any]) -> Any:
         return ui.HGroup({"Weight": 0, "Spacing": 8}, [
-            ui.Label({"Text": label, "MinimumSize": [label_width, 0], "Weight": 0}), *controls,
+            ui.Label({"Text": label, "MinimumSize": [label_width, 26], "MaximumSize": [label_width, 26], "Weight": 0}), *controls,
         ])
 
-    field = lambda options: ui.LineEdit({"MinimumSize": [field_width, 0], "Weight": 1, **options})
-    combo = lambda options: ui.ComboBox({"MinimumSize": [field_width, 0], "Weight": 1, **options})
-    window = dispatcher.AddWindow({"ID": "RTNShotExporter", "WindowTitle": "Resolve to Nuke Shot Exporter", "Geometry": [120, 80, 1320, 840]}, [
+    field = lambda options: ui.LineEdit({"MinimumSize": [field_width, 26], "MaximumSize": [16777215, 26], "Weight": 1, **options})
+    combo = lambda options: ui.ComboBox({"MinimumSize": [field_width, 26], "MaximumSize": [16777215, 26], "Weight": 1, **options})
+    window = dispatcher.AddWindow({"ID": "RTNShotExporter", "WindowTitle": "Resolve to Nuke Shot Exporter", "Geometry": [120, 80, 1100, 900]}, [
         ui.VGroup({"Spacing": 8}, [
             ui.Label({"Text": "Resolve to Nuke Shot Exporter", "Weight": 0, "StyleSheet": "font-size: 18px; font-weight: bold"}),
             row("Sequence", [field({"ID": "sequence", "Text": _call(timeline, "GetName", "sequence")})]),
             ui.TabBar({"ID": "tabs", "CurrentIndex": 0, "Weight": 0}),
-            ui.HGroup({"Weight": 0, "Spacing": 14}, [
+            ui.HGroup({"Weight": 1, "Spacing": 14}, [
                 # Do not use ui.Stack here.  In Resolve's embedded UIManager it
                 # can initially paint every child page on top of the selected
                 # one.  A regular layout plus explicit Hidden states is stable.
@@ -1056,19 +1100,20 @@ Paths are relative to Project Root. Use {track} in rename templates when names m
                         ui.Label({"Text": "Blank tracks means every video track. Duplicate names are allowed and reported as a warning.", "Weight": 0}),
                         row("Rename tracks", [field({"ID": "rename_tracks", "PlaceholderText": "blank = all video tracks; e.g. 1,2,4"})]),
                         row("Name template", [field({"ID": "shot_template", "Text": "{sequence}_{shot_index:03}"})]),
-                        ui.HGroup({"Weight": 0}, [ui.Button({"ID": "preview_rename", "Text": "Preview Rename", "MinimumSize": [140, 0]}), ui.Button({"ID": "apply_rename", "Text": "Rename Clips", "MinimumSize": [140, 0]}), ui.HGap(0, 1)]),
+                        ui.HGroup({"Weight": 0}, [ui.Button({"ID": "preview_rename", "Text": "Preview Rename", "MinimumSize": [140, 28], "MaximumSize": [140, 28], "Weight": 0}), ui.Button({"ID": "apply_rename", "Text": "Rename Clips", "MinimumSize": [140, 28], "MaximumSize": [140, 28], "Weight": 0}), ui.HGap(0, 1)]),
+                        ui.VGap(0, 1),
                     ]),
                     ui.HGroup({"ID": "export_page", "Spacing": 14, "Weight": 1, "Hidden": True}, [
                         ui.VGroup({"Spacing": 7, "Weight": 1}, [
                             section("Shot and source selection"),
-                            row("Project Root", [field({"ID": "root", "PlaceholderText": "/show/project"}), ui.Button({"ID": "choose_root", "Text": "Choose…", "MinimumSize": [95, 0], "Weight": 0})]),
+                            row("Project Root", [field({"ID": "root", "PlaceholderText": "/show/project"}), ui.Button({"ID": "choose_root", "Text": "Choose…", "MinimumSize": [95, 28], "MaximumSize": [95, 28], "Weight": 0})]),
                             row("Version", [field({"ID": "version", "Text": "v001"})]),
                             row("Shot track", [combo({"ID": "shot_track"})]),
                             row("Source tracks", [field({"ID": "tracks", "PlaceholderText": "blank = all video tracks; e.g. 1,2,4"})]),
                             row("Handles", [field({"ID": "handles", "Text": "0"})]),
                             row("Write timecode", [combo({"ID": "tc_track"})]),
                             section("Isolated source plates"),
-                            row("Export plates", [ui.CheckBox({"ID": "export_plates", "Text": "Render isolated source plates", "Weight": 0}), ui.CheckBox({"ID": "sidecar", "Text": "Write metadata JSON", "Weight": 0}), ui.HGap(0, 1)]),
+                            row("Export plates", [ui.CheckBox({"ID": "export_plates", "Text": "Render isolated source plates", "Weight": 0, "MinimumSize": [0, 26]}), ui.CheckBox({"ID": "sidecar", "Text": "Write metadata JSON", "Weight": 0, "MinimumSize": [0, 26]}), ui.HGap(0, 1)]),
                             row("Plate tracks", [field({"ID": "plate_tracks", "PlaceholderText": "blank = every source track"})]),
                             row("Resolve format", [combo({"ID": "plate_format"})]),
                             row("Resolve codec", [combo({"ID": "plate_codec"})]),
@@ -1076,13 +1121,15 @@ Paths are relative to Project Root. Use {track} in rename templates when names m
                             row("Scale mode", [combo({"ID": "scale_mode"})]),
                             row("Scaling method", [combo({"ID": "scaling_method"})]),
                             row("Resize filter", [combo({"ID": "resize_filter"})]),
+                            ui.VGap(0, 1),
                         ]),
                         ui.VGroup({"Spacing": 7, "Weight": 1}, [
                             section("Nuke Write node"),
                             row("Write file type", [combo({"ID": "write_file_type"})]),
-                        row("Write extension", [field({"ID": "write_ext", "ReadOnly": True})]),
-                        row("Nuke start frame", [field({"ID": "nuke_start_frame", "Text": "1001"})]),
-                        row("Nuke MOV codec", [combo({"ID": "nuke_write_codec"})]),
+                            row("Write extension", [field({"ID": "write_ext", "ReadOnly": True})]),
+                            row("Nuke start frame", [field({"ID": "nuke_start_frame", "Text": "1001"})]),
+                            row("Nuke MOV codec", [combo({"ID": "nuke_write_codec"})]),
+                            row("Nuke codec profile", [combo({"ID": "nuke_write_profile"})]),
                             row("Colour tag", [field({"ID": "color_tag", "Text": "Same as Project"})]),
                             row("Gamma tag", [field({"ID": "gamma_tag", "Text": "Same as Project"})]),
                             section("Output templates"),
@@ -1090,23 +1137,24 @@ Paths are relative to Project Root. Use {track} in rename templates when names m
                             row("Nuke Write target", [field({"ID": "write_template", "Text": DEFAULT_WRITE_TEMPLATE})]),
                             row("Transcoded plate", [field({"ID": "plate_template", "Text": DEFAULT_PLATE_TEMPLATE})]),
                             section("Preset and actions"),
-                            row("Preset", [field({"ID": "preset_name", "Text": "default"}), ui.Button({"ID": "load_preset", "Text": "Load", "MinimumSize": [70, 0], "Weight": 0}), ui.Button({"ID": "save_preset", "Text": "Save", "MinimumSize": [70, 0], "Weight": 0})]),
-                            ui.HGroup({"Weight": 0}, [ui.HGap(0, 1), ui.Button({"ID": "preview_export", "Text": "Preflight", "MinimumSize": [130, 0]}), ui.Button({"ID": "run_export", "Text": "Export Shots", "MinimumSize": [130, 0]})]),
+                            row("Preset", [field({"ID": "preset_name", "Text": "default"}), ui.Button({"ID": "load_preset", "Text": "Load", "MinimumSize": [70, 28], "MaximumSize": [70, 28], "Weight": 0}), ui.Button({"ID": "save_preset", "Text": "Save", "MinimumSize": [70, 28], "MaximumSize": [70, 28], "Weight": 0})]),
+                            ui.HGroup({"Weight": 0}, [ui.HGap(0, 1), ui.Button({"ID": "preview_export", "Text": "Preflight", "MinimumSize": [130, 28], "MaximumSize": [130, 28], "Weight": 0}), ui.Button({"ID": "run_export", "Text": "Export Shots", "MinimumSize": [130, 28], "MaximumSize": [130, 28], "Weight": 0})]),
+                            ui.VGap(0, 1),
                         ]),
                     ]),
-                ]),
-                ui.VGroup({"MinimumSize": [290, 0], "MaximumSize": [340, 16777215], "Spacing": 5, "Weight": 0}, [
-                    section("Token reference"),
-                    ui.TextEdit({"ID": "token_reference", "ReadOnly": True, "PlainText": token_help, "MinimumSize": [290, 500], "Weight": 1}),
+                    ui.VGroup({"ID": "tokens_page", "Spacing": 8, "Weight": 1, "Hidden": True}, [
+                        section("Token reference"),
+                        ui.TextEdit({"ID": "token_reference", "ReadOnly": True, "PlainText": token_help, "Weight": 1}),
+                    ]),
                 ]),
             ]),
             section("Status"),
-            ui.TextEdit({"ID": "status", "ReadOnly": True, "PlainText": "Ready. Preview Rename or Preflight before applying changes.", "MinimumSize": [0, 160], "Weight": 1}),
-            ui.HGroup({"Weight": 0}, [ui.HGap(0, 1), ui.Button({"ID": "close", "Text": "Close", "MinimumSize": [110, 0], "Weight": 0})]),
+            ui.TextEdit({"ID": "status", "ReadOnly": True, "PlainText": "Ready. Preview Rename or Preflight before applying changes.", "MinimumSize": [0, 110], "MaximumSize": [16777215, 150], "Weight": 0}),
+            ui.HGroup({"Weight": 0}, [ui.HGap(0, 1), ui.Button({"ID": "close", "Text": "Close", "MinimumSize": [110, 28], "MaximumSize": [110, 28], "Weight": 0})]),
         ])
     ])
     items = window.GetItems()
-    for label in ("Rename", "Export"):
+    for label in ("Rename", "Export", "Tokens"):
         items["tabs"].AddTab(label)
     # A TabBar has no valid selection until its tabs have been added.
     items["tabs"].CurrentIndex = 0
@@ -1156,10 +1204,36 @@ Paths are relative to Project Root. Use {track} in rename templates when names m
             items["nuke_write_codec"].Enabled = True
             for codec in NUKE_MOV_CODECS:
                 items["nuke_write_codec"].AddItem(codec)
-            items["nuke_write_codec"].CurrentText = "Apple ProRes"
+            items["nuke_write_codec"].CurrentIndex = 0
         else:
             items["nuke_write_codec"].Enabled = False
             items["nuke_write_codec"].AddItem("Not applicable")
+        refresh_write_profiles()
+
+    def refresh_write_profiles(ev: Any = None) -> None:
+        items["nuke_write_profile"].Clear()
+        label = str(getattr(items["write_file_type"], "CurrentText", "EXR"))
+        file_type = NUKE_WRITE_TYPES.get(label, ("exr", "exr"))[0]
+        codec = str(getattr(items["nuke_write_codec"], "CurrentText", ""))
+        if file_type == "mov" and codec in NUKE_MOV_PROFILES:
+            _knob, values, default = NUKE_MOV_PROFILES[codec]
+            items["nuke_write_profile"].Enabled = True
+            for value in values:
+                items["nuke_write_profile"].AddItem(value)
+            items["nuke_write_profile"].CurrentIndex = values.index(default)
+        else:
+            items["nuke_write_profile"].Enabled = False
+            items["nuke_write_profile"].AddItem("Not applicable")
+
+    def select_combo(control: str, text_value: str) -> None:
+        try:
+            for index in range(int(items[control].Count())):
+                if str(items[control].ItemText(index)) == text_value:
+                    items[control].CurrentIndex = index
+                    return
+        except (AttributeError, TypeError):
+            pass
+        items[control].CurrentText = text_value
 
     items["write_file_type"].CurrentText = "EXR"
     if "EXR" in render_options:
@@ -1254,9 +1328,11 @@ Paths are relative to Project Root. Use {track} in rename templates when names m
             refresh_codecs()
             saved_codec = str(data.get("plate_codec", ""))
             items["plate_codec"].CurrentText = next((label for label, codec_id in render_options.get(format_label, {}).get("codecs", {}).items() if codec_id == saved_codec), "")
-            items["write_file_type"].CurrentText = next((label for label, spec in NUKE_WRITE_TYPES.items() if spec[0] == data.get("write_file_type")), "EXR")
+            select_combo("write_file_type", next((label for label, spec in NUKE_WRITE_TYPES.items() if spec[0] == data.get("write_file_type")), "EXR"))
             refresh_write_options()
-            items["nuke_write_codec"].CurrentText = str(data.get("nuke_write_codec", "Apple ProRes"))
+            select_combo("nuke_write_codec", normalise_mov_codec(str(data.get("nuke_write_codec", "Apple ProRes"))))
+            refresh_write_profiles()
+            select_combo("nuke_write_profile", str(data.get("nuke_write_profile", "")))
             items["tc_track"].CurrentIndex = max(0, int(data.get("timecode_track", 1)) - 1)
             status("Loaded preset '%s'." % name)
         except Exception as exc:
@@ -1268,9 +1344,10 @@ Paths are relative to Project Root. Use {track} in rename templates when names m
             items["root"].Text = str(path)
 
     def tab_changed(ev: Any = None) -> None:
-        show_rename = items["tabs"].CurrentIndex == 0
-        items["rename_page"].Hidden = not show_rename
-        items["export_page"].Hidden = show_rename
+        index = items["tabs"].CurrentIndex
+        items["rename_page"].Hidden = index != 0
+        items["export_page"].Hidden = index != 1
+        items["tokens_page"].Hidden = index != 2
         window.RecalcLayout()
 
     window.On.preview_rename.Clicked = rename_preview
@@ -1282,6 +1359,7 @@ Paths are relative to Project Root. Use {track} in rename templates when names m
     window.On.choose_root.Clicked = choose_root
     window.On.plate_format.CurrentIndexChanged = refresh_codecs
     window.On.write_file_type.CurrentIndexChanged = refresh_write_options
+    window.On.nuke_write_codec.CurrentIndexChanged = refresh_write_profiles
     window.On.tabs.CurrentChanged = tab_changed
     window.On.close.Clicked = lambda ev=None: dispatcher.ExitLoop()
     window.On.RTNShotExporter.Close = lambda ev=None: dispatcher.ExitLoop()
