@@ -7,6 +7,17 @@ The Rename action requires Resolve 20.2+. Resolve 20.0 and 20.1 can preview
 the proposed names and use the exporter, but Blackmagic had not yet exposed
 timeline-item renaming through the public scripting API.
 
+<!-- moeffect-demo:start -->
+## Demo
+
+This Nuke tools overview includes Resolve-to-Nuke Shot Exporter alongside NukeRTX, Nuke Pi and Smart Publisher.
+
+https://github.com/user-attachments/assets/db29f247-aaeb-49be-a723-643c0534d28a
+
+[Watch on the website and read more about the tool collection](https://moeffect.gr/index.php/tools/nuke-tools/).
+
+<!-- moeffect-demo:end -->
+
 ## Install
 
 ### macOS and Windows — Workflow Integration (recommended)
